@@ -1,0 +1,30 @@
+brokersim (in-process AMQP 1.0, AMQP 0-9-1 and Entra ID token endpoint fakes, in Go)
+Copyright 2026 Abhinav Gautam
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M from public specifications and service
+documentation (PROVENANCE.md). It contains no code from other projects.
+The source files that come from SigmaM2M (amqpsim, amqp091sim, entrasim)
+carry no per-file copyright header, the convention of the code they come
+from; the copyright line above covers them. Files added for this module
+carry "Copyright 2026 Abhinav Gautam" and "SPDX-License-Identifier:
+Apache-2.0".
+
+Azure, Service Bus, Event Hubs, Microsoft Entra and RabbitMQ are
+trademarks of their owners. This module is not made, endorsed or supported
+by them; the names say only which behaviour the fakes imitate.
+
+Dependencies
+------------
+
+- github.com/Azure/go-amqp (MIT licence): the AMQP 1.0 message type used in
+  amqpsim's API (Send, SendEvent, Received) and by its tests.
+- github.com/rabbitmq/amqp091-go (BSD-2-Clause licence): tests and the
+  example only.
+
+Test data
+---------
+
+Every user name, password, tenant, client ID, secret, key and address in
+the tests, the example and cmd/brokersim is a made-up demo value.
