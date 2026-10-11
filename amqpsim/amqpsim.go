@@ -16,7 +16,13 @@
 //   - the $management node (READ of com.microsoft:eventhub answers the
 //     partition IDs) and the $cbs node (put-token, checked by a hook);
 //   - SASL PLAIN and ANONYMOUS, an unknown address refused with
-//     amqp:not-found, a message refused by a hook with amqp:rejected.
+//     amqp:not-found, a message refused by a hook with amqp:rejected;
+//   - since v0.2.0 (servicebus.go): lock tokens and sequence numbers,
+//     abandon, defer and dead-letter outcomes with a $DeadLetterQueue
+//     subqueue and a maximum delivery count, scheduled messages, the
+//     Service Bus $management operations (schedule, cancel, lock
+//     renewal), message sessions, Event Hubs batches and partition
+//     properties, TLS, throttling and size refusals.
 //
 // References: OASIS AMQP 1.0 (http://docs.oasis-open.org/amqp/core/v1.0/),
 // Event Hubs AMQP (https://learn.microsoft.com/azure/event-hubs/
@@ -26,6 +32,7 @@ package amqpsim
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -57,6 +64,16 @@ type Options struct {
 	// PutToken checks a CBS put-token (audience, token); nil accepts
 	// every token.
 	PutToken func(audience, token string) bool
+	// TLS serves amqps with this configuration (testcert makes one).
+	TLS *tls.Config
+	// Throttle, when set, is asked before a message sent to address is
+	// taken; an error refuses it with com.microsoft:server-busy (as a
+	// throttled namespace does) and the error's text.
+	Throttle func(address string) error
+	// MaxSize refuses a message larger than this many bytes with
+	// amqp:link:message-size-exceeded (the quota of a namespace tier);
+	// 0 is no limit.
+	MaxSize int
 }
 
 // Received is a message a client sent to an address.
@@ -84,11 +101,22 @@ type stored struct {
 	payload []byte
 	msg     *amqp.Message
 	count   uint32 // deliveries so far
+
+	// Service Bus queues
+	seq       int64
+	enqueued  time.Time
+	visibleAt time.Time // scheduled messages
+	session   string    // the message's group ID
 }
 
 type queue struct {
-	name  string
-	ready []*stored
+	name     string
+	ready    []*stored
+	opts     QueueOptions
+	nextSeq  int64
+	dlq      *queue
+	locks    map[string]*link // session ID → the link holding its lock
+	deferred []*stored
 }
 
 type hub struct {
@@ -111,6 +139,9 @@ func StartOn(addr string, o Options) (*Broker, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
+	}
+	if o.TLS != nil {
+		ln = tls.NewListener(ln, o.TLS)
 	}
 	b := &Broker{opts: o, ln: ln, queues: map[string]*queue{}, hubs: map[string]*hub{}, conns: map[*conn]bool{}}
 	b.wg.Add(1)
@@ -172,11 +203,12 @@ func (b *Broker) Send(queueName string, m *amqp.Message) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	q := b.queues[queueName]
+	_ = payload
+	q := b.queueFor(queueName)
 	if q == nil {
 		return fmt.Errorf("no queue %s", queueName)
 	}
-	q.ready = append(q.ready, &stored{payload: payload, msg: m})
+	b.enqueueLocked(q, m)
 	b.pumpLocked()
 	return nil
 }
@@ -326,6 +358,9 @@ type link struct {
 	inboundID  uint32
 	inboundSet bool
 	settledIn  bool
+	format     uint32 // message format of the transfer arriving
+	session    string // the Service Bus session this receiver holds
+	entity     string // a  link's entity ("" for the namespace)
 }
 
 // ---- frames -------------------------------------------------------------
@@ -530,6 +565,8 @@ func (c *conn) onFrame(ch uint16, code uint64, f []any, payload []byte) error {
 			id, _ := asUint(field(f, 1))
 			l.inboundID, l.inboundSet = uint32(id), true
 			l.settledIn = asBool(field(f, 4))
+			fmtv, _ := asUint(field(f, 3))
+			l.format = uint32(fmtv)
 		}
 		l.inbound = append(l.inbound, payload...)
 		if asBool(field(f, 5)) { // more
@@ -560,7 +597,12 @@ func (c *conn) onFrame(ch uint16, code uint64, f []any, payload []byte) error {
 					func(w *writer) { w.boolean(true) }, func(w *writer) {
 						if rejectErr != nil {
 							w.described(codeRejected, func(w *writer) {
-								w.list(errorValue("amqp:rejected", rejectErr.Error()))
+								cond := "amqp:rejected"
+								var ce *condError
+								if errors.As(rejectErr, &ce) {
+									cond = ce.cond
+								}
+								w.list(errorValue(cond, rejectErr.Error()))
 							})
 						} else {
 							w.described(codeAccepted, func(w *writer) { w.list() })
@@ -585,9 +627,8 @@ func (c *conn) onFrame(ch uint16, code uint64, f []any, payload []byte) error {
 					continue
 				}
 				delete(l.unsettled, id)
-				if l.q != nil && (state.Code == codeReleased || state.Code == codeModified) {
-					st.count++
-					l.q.ready = append([]*stored{st}, l.q.ready...)
+				if l.q != nil {
+					b.settleQueueLocked(l.q, st, state)
 				}
 			}
 			if id == uint32(last) {
@@ -595,6 +636,25 @@ func (c *conn) onFrame(ch uint16, code uint64, f []any, payload []byte) error {
 			}
 		}
 		b.pumpLocked()
+		if !asBool(field(f, 3)) {
+			// Receiver settle mode second: the client waits for the
+			// broker to settle the outcome.
+			return c.frame(0, s.ch, func(w *writer) {
+				w.described(codeDisposition, func(w *writer) {
+					w.list(func(w *writer) { w.boolean(false) }, func(w *writer) { w.uint(uint32(first)) }, func(w *writer) { w.uint(uint32(last)) },
+						func(w *writer) { w.boolean(true) }, func(w *writer) {
+							if state.Code == codeRejected {
+								// The outcome is taken: settled as rejected,
+								// without the client's error (which clients
+								// would read as a failure of the settlement).
+								w.described(codeRejected, func(w *writer) { w.list() })
+								return
+							}
+							w.any(field(f, 4))
+						})
+				})
+			}, nil)
+		}
 		return nil
 	case codeDetach:
 		h, _ := asUint(field(f, 0))
@@ -638,12 +698,12 @@ func (c *conn) attachLocked(s *session, f []any) error {
 	tgtL, _ := tgt.Value.([]any)
 	l := &link{name: name, handle: uint32(h), ours: s.nextHandle, sender: clientReceiver, unsettled: map[uint32]*stored{}, partition: -1}
 	s.nextHandle++
-	refuse := ""
+	refuse, refuseCond, sessionLocked := "", "amqp:not-found", false
 	if clientReceiver {
 		l.address = asString(field(srcL, 0))
 		l.replyTo = asString(field(tgtL, 0))
 		switch {
-		case l.address == "$management" || l.address == "$cbs":
+		case isNode(l.address):
 		case hubAddr.MatchString(l.address):
 			m := hubAddr.FindStringSubmatch(l.address)
 			hb := b.hubs[m[1]]
@@ -662,7 +722,7 @@ func (c *conn) attachLocked(s *session, f []any) error {
 				}
 			}
 		default:
-			q := b.queues[l.address]
+			q := b.queueFor(l.address)
 			if q == nil && b.opts.AutoCreate {
 				q = &queue{name: l.address}
 				b.queues[l.address] = q
@@ -671,14 +731,35 @@ func (c *conn) attachLocked(s *session, f []any) error {
 				refuse = "The messaging entity '" + l.address + "' could not be found."
 			}
 			l.q = q
+			if q != nil {
+				if filters, ok := field(srcL, 7).(map[any]any); ok {
+					for k, v := range filters {
+						if asString(k) != "com.microsoft:session-filter" {
+							continue
+						}
+						d, _ := v.(Described)
+						sid, why := q.lockSessionLocked(l, asString(d.Value), d.Value == nil)
+						if why != "" {
+							refuse, refuseCond = why, "com.microsoft:session-cannot-be-locked"
+							if d.Value == nil {
+								refuseCond = "com.microsoft:timeout"
+							}
+							break
+						}
+						d.Value = sid
+						filters[k] = d
+						sessionLocked = true
+					}
+				}
+			}
 		}
 	} else {
 		l.address = asString(field(tgtL, 0))
 		switch {
-		case l.address == "$management" || l.address == "$cbs":
+		case isNode(l.address):
 		case b.hubs[strings.SplitN(l.address, "/", 2)[0]] != nil && hubSend.MatchString(l.address):
 		default:
-			if b.queues[l.address] == nil {
+			if b.queueFor(l.address) == nil {
 				if b.opts.AutoCreate {
 					b.queues[l.address] = &queue{name: l.address}
 				} else {
@@ -702,7 +783,15 @@ func (c *conn) attachLocked(s *session, f []any) error {
 			} else {
 				items = append(items, func(w *writer) { w.any(field(f, 5)) }, func(w *writer) { w.any(field(f, 6)) })
 			}
-			items = append(items, func(w *writer) { w.null() }, func(w *writer) { w.boolean(false) }, func(w *writer) { w.uint(0) })
+			items = append(items, func(w *writer) { w.null() }, func(w *writer) { w.boolean(false) }, func(w *writer) { w.uint(0) }, func(w *writer) { w.ulong(1 << 20) })
+			if sessionLocked {
+				// offered and desired capabilities, then the session lock's expiry.
+				until := dotnetTicks(time.Now().Add(l.q.options().LockDuration))
+				items = append(items, func(w *writer) { w.null() }, func(w *writer) { w.null() },
+					func(w *writer) {
+						w.mapOf(func(w *writer) { w.sym("com.microsoft:locked-until-utc") }, func(w *writer) { w.long(until) })
+					})
+			}
 			w.list(items...)
 		})
 	}, nil)
@@ -712,7 +801,7 @@ func (c *conn) attachLocked(s *session, f []any) error {
 	if refuse != "" {
 		return c.frame(0, s.ch, func(w *writer) {
 			w.described(codeDetach, func(w *writer) {
-				w.list(func(w *writer) { w.uint(l.ours) }, func(w *writer) { w.boolean(true) }, errorValue("amqp:not-found", refuse))
+				w.list(func(w *writer) { w.uint(l.ours) }, func(w *writer) { w.boolean(true) }, errorValue(refuseCond, refuse))
 			})
 		}, nil)
 	}
@@ -761,18 +850,31 @@ func startPosition(evs []*event, filter string) int {
 
 // deliverInboundLocked handles a message a client sent.
 func (b *Broker) deliverInboundLocked(c *conn, s *session, l *link, m *amqp.Message, data []byte) error {
-	switch l.address {
-	case "$management":
-		return b.managementLocked(c, m)
-	case "$cbs":
+	switch {
+	case l.address == "$management" || strings.HasSuffix(l.address, "/$management"):
+		return b.managementLocked(c, l, m)
+	case l.address == "$cbs":
 		return b.cbsLocked(c, m)
 	}
-	if b.opts.Reject != nil {
-		if err := b.opts.Reject(l.address, m); err != nil {
-			return err
+	if b.opts.MaxSize > 0 && len(data) > b.opts.MaxSize {
+		return &condError{"amqp:link:message-size-exceeded", fmt.Sprintf("The received message (%d bytes) exceeds the limit (%d bytes).", len(data), b.opts.MaxSize)}
+	}
+	if b.opts.Throttle != nil {
+		if err := b.opts.Throttle(l.address); err != nil {
+			return &condError{"com.microsoft:server-busy", err.Error()}
 		}
 	}
-	b.received = append(b.received, Received{Address: l.address, Message: m})
+	msgs := unbatch(l.format, m)
+	if b.opts.Reject != nil {
+		for _, one := range msgs {
+			if err := b.opts.Reject(l.address, one); err != nil {
+				return err
+			}
+		}
+	}
+	for _, one := range msgs {
+		b.received = append(b.received, Received{Address: l.address, Message: one})
+	}
 	if parts := hubSend.FindStringSubmatch(l.address); parts != nil && b.hubs[parts[1]] != nil {
 		h := b.hubs[parts[1]]
 		p := 0
@@ -780,10 +882,14 @@ func (b *Broker) deliverInboundLocked(c *conn, s *session, l *link, m *amqp.Mess
 			p, _ = strconv.Atoi(parts[3])
 		}
 		if p < len(h.partitions) {
-			b.appendEventLocked(h, p, m, nil)
+			for _, one := range msgs {
+				b.appendEventLocked(h, p, one, nil)
+			}
 		}
-	} else if q := b.queues[l.address]; q != nil {
-		q.ready = append(q.ready, &stored{payload: data, msg: m})
+	} else if q := b.queueFor(l.address); q != nil {
+		for _, one := range msgs {
+			b.enqueueLocked(q, one)
+		}
 	}
 	b.pumpLocked()
 	return nil
@@ -802,7 +908,7 @@ func (b *Broker) replyLocked(c *conn, req *amqp.Message, status int32, desc stri
 	payload, _ := resp.MarshalBinary()
 	for _, s := range c.sessions {
 		for _, l := range s.links {
-			if l.sender && (l.address == "$management" || l.address == "$cbs") && (l.replyTo == to || to == "") {
+			if l.sender && isNode(l.address) && (l.replyTo == to || to == "") {
 				l.pending = append(l.pending, &stored{payload: payload, msg: resp})
 			}
 		}
@@ -810,11 +916,17 @@ func (b *Broker) replyLocked(c *conn, req *amqp.Message, status int32, desc stri
 	b.pumpLocked()
 }
 
-func (b *Broker) managementLocked(c *conn, m *amqp.Message) error {
+func (b *Broker) managementLocked(c *conn, l *link, m *amqp.Message) error {
 	op, _ := m.ApplicationProperties["operation"].(string)
 	typ, _ := m.ApplicationProperties["type"].(string)
 	name, _ := m.ApplicationProperties["name"].(string)
-	if op != "READ" || typ != "com.microsoft:eventhub" {
+	if entity := strings.TrimSuffix(l.address, "/$management"); entity != l.address {
+		if q := b.queueFor(entity); q != nil && b.serviceBusManagementLocked(c, m, op, q) {
+			b.pumpLocked()
+			return nil
+		}
+	}
+	if op != "READ" || (typ != "com.microsoft:eventhub" && typ != "com.microsoft:partition") {
 		b.replyLocked(c, m, 400, "unsupported operation", nil)
 		return nil
 	}
@@ -823,12 +935,16 @@ func (b *Broker) managementLocked(c *conn, m *amqp.Message) error {
 		b.replyLocked(c, m, 404, "The messaging entity '"+name+"' could not be found.", nil)
 		return nil
 	}
+	if typ == "com.microsoft:partition" {
+		b.partitionPropertiesLocked(c, m, h)
+		return nil
+	}
 	ids := make([]string, len(h.partitions))
 	for i := range ids {
 		ids[i] = strconv.Itoa(i)
 	}
 	b.replyLocked(c, m, 200, "OK", map[string]any{"name": name, "type": typ, "partition_count": int32(len(ids)),
-		"partition_ids": ids, "created_at": time.Unix(1700000000, 0)})
+		"partition_ids": ids, "created_at": time.Unix(1700000000, 0), "georeplication_factor": int32(1)})
 	return nil
 }
 
@@ -868,8 +984,8 @@ func (b *Broker) pumpLocked() {
 					switch {
 					case len(l.pending) > 0:
 						st, l.pending = l.pending[0], l.pending[1:]
-					case l.q != nil && len(l.q.ready) > 0:
-						st, l.q.ready = l.q.ready[0], l.q.ready[1:]
+					case l.q != nil:
+						st = l.q.takeLocked(l)
 					case l.hub != nil && l.pos < len(l.hub.partitions[l.partition]):
 						st = &l.hub.partitions[l.partition][l.pos].stored
 						l.pos++
@@ -885,7 +1001,9 @@ func (b *Broker) pumpLocked() {
 						l.unsettled[id] = st
 					}
 					payload := st.payload
-					if st.count > 0 {
+					if l.q != nil {
+						payload = deliveryPayload(l.q, st)
+					} else if st.count > 0 {
 						// The header's delivery-count says it was tried before.
 						cp := *st.msg
 						hdr := amqp.MessageHeader{DeliveryCount: st.count}
@@ -898,6 +1016,9 @@ func (b *Broker) pumpLocked() {
 					}
 					tag := make([]byte, 4)
 					binary.BigEndian.PutUint32(tag, id)
+					if l.q != nil {
+						tag = lockToken()
+					}
 					c.frame(0, s.ch, func(w *writer) {
 						w.described(codeTransfer, func(w *writer) {
 							w.list(func(w *writer) { w.uint(l.ours) }, func(w *writer) { w.uint(id) }, func(w *writer) { w.bin(tag) },
@@ -921,11 +1042,12 @@ func (b *Broker) releaseLinkLocked(l *link) {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
 	for _, id := range ids {
-		st := l.unsettled[id]
-		st.count++
-		l.q.ready = append([]*stored{st}, l.q.ready...)
+		b.redeliverLocked(l.q, l.unsettled[id])
 	}
 	l.unsettled = map[uint32]*stored{}
+	if l.session != "" && l.q.locks[l.session] == l {
+		delete(l.q.locks, l.session)
+	}
 }
 
 func (c *conn) releaseLocked() {

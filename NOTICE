@@ -1,4 +1,4 @@
-brokersim (in-process AMQP 1.0, AMQP 0-9-1 and Entra ID token endpoint fakes, in Go)
+brokersim (in-process AMQP 1.0, AMQP 0-9-1, Kafka and Entra ID token endpoint fakes, in Go)
 Copyright 2026 Abhinav Gautam
 
 This module is licensed under the Apache License, Version 2.0 (LICENSE).
@@ -22,6 +22,12 @@ Dependencies
   amqpsim's API (Send, SendEvent, Received) and by its tests.
 - github.com/rabbitmq/amqp091-go (BSD-2-Clause licence): tests and the
   example only.
+- github.com/twmb/franz-go and its pkg/kfake (BSD-3-Clause licence):
+  kafkasim runs kfake; the client is used by its test.
+
+The interop module (a separate module, not imported by this one) also
+uses the Azure SDK for Go (azcore, azidentity, azservicebus, azeventhubs;
+MIT licence) and, in Docker, the RabbitMQ image (MPL-2.0).
 
 Test data
 ---------

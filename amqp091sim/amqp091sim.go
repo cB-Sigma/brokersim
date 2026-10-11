@@ -19,10 +19,12 @@ package amqp091sim
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -44,6 +46,8 @@ type Message struct {
 	MessageID   string
 	Timestamp   time.Time
 	Redelivered bool
+
+	enqueued time.Time // when it entered its queue (x-message-ttl)
 }
 
 // Options configure the broker.
@@ -52,6 +56,12 @@ type Options struct {
 	Users map[string]string
 	// VHosts are the virtual hosts (default "/").
 	VHosts []string
+	// TLS serves AMQP 0-9-1 over TLS (amqps) with this configuration
+	// (testcert makes one).
+	TLS *tls.Config
+	// Restore starts the broker from a Snapshot: durable exchanges,
+	// queues, bindings and their messages, as a broker restart keeps them.
+	Restore []byte
 }
 
 // Broker is the in-process broker.
@@ -72,10 +82,12 @@ type Broker struct {
 type exchange struct {
 	name, kind string
 	bindings   []binding
+	durable    bool
 }
 
 type binding struct {
 	queue, key string
+	args       map[string]any
 }
 
 type queue struct {
@@ -86,6 +98,8 @@ type queue struct {
 	next      int // round robin
 	exclusive *conn
 	unacked   int
+	durable   bool
+	args      map[string]any
 }
 
 type consumer struct {
@@ -110,10 +124,19 @@ func StartOn(addr string, o Options) (*Broker, error) {
 	if err != nil {
 		return nil, err
 	}
+	if o.TLS != nil {
+		ln = tls.NewListener(ln, o.TLS)
+	}
 	b := &Broker{opts: o, ln: ln, exchanges: map[string]*exchange{}, queues: map[string]*queue{}, conns: map[*conn]bool{}}
 	for _, vh := range o.VHosts {
-		for _, e := range []struct{ n, k string }{{"", "direct"}, {"amq.direct", "direct"}, {"amq.topic", "topic"}, {"amq.fanout", "fanout"}} {
+		for _, e := range []struct{ n, k string }{{"", "direct"}, {"amq.direct", "direct"}, {"amq.topic", "topic"}, {"amq.fanout", "fanout"}, {"amq.headers", "headers"}, {"amq.match", "headers"}} {
 			b.exchanges[vh+"|"+e.n] = &exchange{name: e.n, kind: e.k}
+		}
+	}
+	if o.Restore != nil {
+		if err := b.restore(o.Restore); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("amqp091sim: restoring the snapshot: %w", err)
 		}
 	}
 	b.wg.Add(1)
@@ -156,6 +179,7 @@ func (b *Broker) DeclareQueue(name, exchange, key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	q := b.queueLocked("/", name, true)
+	q.durable = true
 	if exchange != "" || key != "" {
 		if e := b.exchanges["/|"+exchange]; e != nil {
 			e.bindings = append(e.bindings, binding{queue: q.name, key: key})
@@ -242,6 +266,8 @@ func (b *Broker) routeLocked(vh string, m Message) int {
 				ok = bd.key == m.RoutingKey
 			case "topic":
 				ok = topicMatch(strings.Split(bd.key, "."), strings.Split(m.RoutingKey, "."))
+			case "headers":
+				ok = headersMatch(bd.args, m.Headers)
 			}
 			if ok {
 				if q := b.queues[vh+"|"+bd.queue]; q != nil {
@@ -252,10 +278,107 @@ func (b *Broker) routeLocked(vh string, m Message) int {
 		}
 	}
 	for _, q := range targets {
-		q.ready = append(q.ready, m)
-		b.dispatchLocked(q)
+		b.enqueueLocked(q, m)
 	}
 	return len(targets)
+}
+
+// enqueueLocked adds a message to a queue, keeping x-max-length (the
+// oldest are dropped, or dead-lettered).
+func (b *Broker) enqueueLocked(q *queue, m Message) {
+	m.enqueued = time.Now()
+	q.ready = append(q.ready, m)
+	if max, ok := intArg(q.args["x-max-length"]); ok && max >= 0 {
+		for len(q.ready) > max {
+			old := q.ready[0]
+			q.ready = q.ready[1:]
+			b.deadLetterLocked(q, old, "maxlen")
+		}
+	}
+	b.dispatchLocked(q)
+}
+
+// headersMatch is the headers exchange: x-match all (default) or any over
+// the binding's arguments, keys starting with "x-" left out.
+func headersMatch(args, h map[string]any) bool {
+	any := args["x-match"] == "any" || args["x-match"] == "any-with-x"
+	n := 0
+	for k, v := range args {
+		if k == "x-match" || (strings.HasPrefix(k, "x-") && args["x-match"] != "all-with-x" && args["x-match"] != "any-with-x") {
+			continue
+		}
+		n++
+		hv, ok := h[k]
+		match := ok && (v == nil || fmt.Sprint(hv) == fmt.Sprint(v))
+		if any && match {
+			return true
+		}
+		if !any && !match {
+			return false
+		}
+	}
+	return !any || n == 0
+}
+
+func intArg(v any) (int, bool) {
+	switch x := v.(type) {
+	case int32:
+		return int(x), true
+	case int64:
+		return int(x), true
+	case int16:
+		return int(x), true
+	case int:
+		return x, true
+	case int8:
+		return int(x), true
+	case uint8:
+		return int(x), true
+	case float64: // from a snapshot's JSON
+		return int(x), true
+	}
+	return 0, false
+}
+
+// deadLetterLocked moves a message its queue dropped to the queue's
+// dead-letter exchange (x-dead-letter-exchange, with
+// x-dead-letter-routing-key or its own routing key), recording why in an
+// x-death header; without one the message is gone.
+func (b *Broker) deadLetterLocked(q *queue, m Message, reason string) {
+	dlx, ok := q.args["x-dead-letter-exchange"].(string)
+	if !ok {
+		return
+	}
+	key := m.RoutingKey
+	if k, ok := q.args["x-dead-letter-routing-key"].(string); ok {
+		key = k
+	}
+	h := map[string]any{}
+	for k, v := range m.Headers {
+		h[k] = v
+	}
+	death := map[string]any{"queue": q.name, "reason": reason, "exchange": m.Exchange, "routing-keys": []any{m.RoutingKey}, "count": int64(1), "time": time.Now()}
+	prev, _ := h["x-death"].([]any)
+	h["x-death"] = append([]any{death}, prev...)
+	if _, ok := h["x-first-death-reason"]; !ok {
+		h["x-first-death-reason"], h["x-first-death-queue"], h["x-first-death-exchange"] = reason, q.name, m.Exchange
+	}
+	m.Headers, m.Exchange, m.RoutingKey, m.Redelivered = h, dlx, key, false
+	b.routeLocked(q.vhost, m)
+}
+
+// expireLocked drops the messages older than the queue's x-message-ttl.
+func (b *Broker) expireLocked(q *queue) {
+	ttl, ok := intArg(q.args["x-message-ttl"])
+	if !ok {
+		return
+	}
+	cut := time.Now().Add(-time.Duration(ttl) * time.Millisecond)
+	for len(q.ready) > 0 && !q.ready[0].enqueued.After(cut) {
+		old := q.ready[0]
+		q.ready = q.ready[1:]
+		b.deadLetterLocked(q, old, "expired")
+	}
 }
 
 // topicMatch is RabbitMQ's topic matching: * one word, # zero or more.
@@ -283,6 +406,7 @@ func topicMatch(p, k []string) bool {
 // dispatchLocked hands ready messages to consumers with room in their
 // channel's prefetch window, round robin.
 func (b *Broker) dispatchLocked(q *queue) {
+	b.expireLocked(q)
 	for len(q.ready) > 0 && len(q.consumers) > 0 {
 		delivered := false
 		for i := 0; i < len(q.consumers); i++ {
@@ -352,6 +476,8 @@ type channel struct {
 	seq      uint64
 	pending  *publish
 	nextCons int
+	tx       bool
+	txOps    []func() error // publishes and acknowledgements waiting for tx.commit
 }
 
 type unacked struct {
@@ -626,7 +752,7 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 				b.mu.Unlock()
 				return c.closeChannel(chID, 404, "NOT_FOUND - no exchange '"+name+"' in vhost '"+c.vhost+"'", 40, 10)
 			}
-			b.exchanges[c.vhost+"|"+name] = &exchange{name: name, kind: kind}
+			b.exchanges[c.vhost+"|"+name] = &exchange{name: name, kind: kind, durable: bits&2 != 0}
 		} else if !passive && e.kind != kind {
 			b.mu.Unlock()
 			return c.closeChannel(chID, 406, "PRECONDITION_FAILED - inequivalent arg 'type' for exchange '"+name+"'", 40, 10)
@@ -641,6 +767,7 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 		name := d.short()
 		bits := d.u8()
 		passive, exclusive, noWait := bits&1 != 0, bits&4 != 0, bits&16 != 0
+		args := d.table()
 		b.mu.Lock()
 		if name == "" {
 			b.nextQ++
@@ -653,6 +780,7 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 				return c.closeChannel(chID, 404, "NOT_FOUND - no queue '"+name+"' in vhost '"+c.vhost+"'", 50, 10)
 			}
 			q = b.queueLocked(c.vhost, name, true)
+			q.durable, q.args = bits&2 != 0, args
 			if exclusive {
 				q.exclusive = c
 			}
@@ -674,6 +802,7 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 		d.u16()
 		qn, en, key := d.short(), d.short(), d.short()
 		noWait := d.u8()&1 != 0
+		bargs := d.table()
 		b.mu.Lock()
 		e := b.exchanges[c.vhost+"|"+en]
 		q := b.queues[c.vhost+"|"+qn]
@@ -687,12 +816,12 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 		}
 		dup := false
 		for _, bd := range e.bindings {
-			if bd.queue == qn && bd.key == key {
+			if bd.queue == qn && bd.key == key && fmt.Sprint(bd.args) == fmt.Sprint(bargs) {
 				dup = true
 			}
 		}
 		if !dup {
-			e.bindings = append(e.bindings, binding{queue: qn, key: key})
+			e.bindings = append(e.bindings, binding{queue: qn, key: key, args: bargs})
 		}
 		b.mu.Unlock()
 		if !noWait {
@@ -759,14 +888,32 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 	case class == 60 && meth == 80: // basic.ack
 		tag := d.u64()
 		multiple := d.u8()&1 != 0
+		if ch.tx {
+			b.mu.Lock()
+			ch.txOps = append(ch.txOps, func() error { return c.settle(ch, tag, multiple, false) })
+			b.mu.Unlock()
+			return nil
+		}
 		return c.settle(ch, tag, multiple, false)
 	case class == 60 && meth == 90: // basic.reject
 		tag := d.u64()
 		requeue := d.u8()&1 != 0
+		if ch.tx {
+			b.mu.Lock()
+			ch.txOps = append(ch.txOps, func() error { return c.settleNack(ch, tag, false, requeue) })
+			b.mu.Unlock()
+			return nil
+		}
 		return c.settleNack(ch, tag, false, requeue)
 	case class == 60 && meth == 120: // basic.nack
 		tag := d.u64()
 		bits := d.u8()
+		if ch.tx {
+			b.mu.Lock()
+			ch.txOps = append(ch.txOps, func() error { return c.settleNack(ch, tag, bits&1 != 0, bits&2 != 0) })
+			b.mu.Unlock()
+			return nil
+		}
 		return c.settleNack(ch, tag, bits&1 != 0, bits&2 != 0)
 	case class == 85 && meth == 10: // confirm.select
 		noWait := d.u8()&1 != 0
@@ -778,7 +925,180 @@ func (c *conn) onMethod(chID uint16, p []byte) error {
 		}
 		return nil
 	}
+	if done, err := c.onMore(ch, chID, class, meth, d); done {
+		return err
+	}
 	return c.closeConn(540, fmt.Sprintf("NOT_IMPLEMENTED - method %d.%d", class, meth), class, meth)
+}
+
+// onMore handles basic.get, transactions, and deleting, purging and
+// unbinding (added in v0.2.0); done is false for any other method.
+func (c *conn) onMore(ch *channel, chID uint16, class, meth uint16, d *dec) (bool, error) {
+	b := c.b
+	switch {
+	case class == 60 && meth == 70: // basic.get
+		d.u16()
+		qn := d.short()
+		noAck := d.u8()&1 != 0
+		b.mu.Lock()
+		q := b.queues[c.vhost+"|"+qn]
+		if q == nil {
+			b.mu.Unlock()
+			return true, c.closeChannel(chID, 404, "NOT_FOUND - no queue '"+qn+"' in vhost '"+c.vhost+"'", 60, 70)
+		}
+		b.expireLocked(q)
+		if len(q.ready) == 0 {
+			b.mu.Unlock()
+			var w enc
+			w.short("")
+			return true, c.method(chID, 60, 72, w.b)
+		}
+		m := q.ready[0]
+		q.ready = q.ready[1:]
+		ch.tag++
+		tag := ch.tag
+		if !noAck {
+			ch.unacked[tag] = unacked{q: q, m: m}
+			q.unacked++
+		}
+		var w enc
+		w.u64(tag)
+		if m.Redelivered {
+			w.u8(1)
+		} else {
+			w.u8(0)
+		}
+		w.short(m.Exchange)
+		w.short(m.RoutingKey)
+		w.u32(uint32(len(q.ready)))
+		c.sendContent(chID, 60, 71, w.b, m)
+		b.mu.Unlock()
+		return true, nil
+	case class == 90 && meth == 10: // tx.select
+		b.mu.Lock()
+		ch.tx = true
+		b.mu.Unlock()
+		return true, c.method(chID, 90, 11, nil)
+	case class == 90 && meth == 20: // tx.commit
+		if !ch.tx {
+			return true, c.closeChannel(chID, 406, "PRECONDITION_FAILED - channel is not transactional", 90, 20)
+		}
+		b.mu.Lock()
+		ops := ch.txOps
+		ch.txOps = nil
+		b.mu.Unlock()
+		for _, op := range ops {
+			if err := op(); err != nil {
+				return true, err
+			}
+		}
+		return true, c.method(chID, 90, 21, nil)
+	case class == 90 && meth == 30: // tx.rollback
+		if !ch.tx {
+			return true, c.closeChannel(chID, 406, "PRECONDITION_FAILED - channel is not transactional", 90, 30)
+		}
+		b.mu.Lock()
+		ch.txOps = nil
+		b.mu.Unlock()
+		return true, c.method(chID, 90, 31, nil)
+	case class == 50 && meth == 30: // queue.purge
+		d.u16()
+		qn := d.short()
+		noWait := d.u8()&1 != 0
+		b.mu.Lock()
+		q := b.queues[c.vhost+"|"+qn]
+		if q == nil {
+			b.mu.Unlock()
+			return true, c.closeChannel(chID, 404, "NOT_FOUND - no queue '"+qn+"' in vhost '"+c.vhost+"'", 50, 30)
+		}
+		n := len(q.ready)
+		q.ready = nil
+		b.mu.Unlock()
+		if noWait {
+			return true, nil
+		}
+		var w enc
+		w.u32(uint32(n))
+		return true, c.method(chID, 50, 31, w.b)
+	case class == 50 && meth == 40: // queue.delete
+		d.u16()
+		qn := d.short()
+		bits := d.u8()
+		ifUnused, ifEmpty, noWait := bits&1 != 0, bits&2 != 0, bits&4 != 0
+		b.mu.Lock()
+		q := b.queues[c.vhost+"|"+qn]
+		n := 0
+		if q != nil {
+			if ifUnused && len(q.consumers) > 0 {
+				b.mu.Unlock()
+				return true, c.closeChannel(chID, 406, "PRECONDITION_FAILED - queue '"+qn+"' in vhost '"+c.vhost+"' in use", 50, 40)
+			}
+			if ifEmpty && len(q.ready) > 0 {
+				b.mu.Unlock()
+				return true, c.closeChannel(chID, 406, "PRECONDITION_FAILED - queue '"+qn+"' in vhost '"+c.vhost+"' not empty", 50, 40)
+			}
+			n = len(q.ready)
+			b.deleteQueueLocked(q)
+		}
+		b.mu.Unlock()
+		if noWait {
+			return true, nil
+		}
+		var w enc
+		w.u32(uint32(n))
+		return true, c.method(chID, 50, 41, w.b)
+	case class == 50 && meth == 50: // queue.unbind
+		d.u16()
+		qn, en, key := d.short(), d.short(), d.short()
+		args := d.table()
+		b.mu.Lock()
+		if e := b.exchanges[c.vhost+"|"+en]; e != nil {
+			kept := e.bindings[:0]
+			for _, bd := range e.bindings {
+				if !(bd.queue == qn && bd.key == key && fmt.Sprint(bd.args) == fmt.Sprint(args)) {
+					kept = append(kept, bd)
+				}
+			}
+			e.bindings = kept
+		}
+		b.mu.Unlock()
+		return true, c.method(chID, 50, 51, nil)
+	case class == 40 && meth == 20: // exchange.delete
+		d.u16()
+		en := d.short()
+		bits := d.u8()
+		b.mu.Lock()
+		e := b.exchanges[c.vhost+"|"+en]
+		if e != nil && bits&1 != 0 && len(e.bindings) > 0 {
+			b.mu.Unlock()
+			return true, c.closeChannel(chID, 406, "PRECONDITION_FAILED - exchange '"+en+"' in vhost '"+c.vhost+"' in use", 40, 20)
+		}
+		delete(b.exchanges, c.vhost+"|"+en)
+		b.mu.Unlock()
+		if bits&2 != 0 {
+			return true, nil
+		}
+		return true, c.method(chID, 40, 21, nil)
+	}
+	return false, nil
+}
+
+// deleteQueueLocked removes a queue, its bindings and its consumers.
+func (b *Broker) deleteQueueLocked(q *queue) {
+	delete(b.queues, q.vhost+"|"+q.name)
+	for k, e := range b.exchanges {
+		if !strings.HasPrefix(k, q.vhost+"|") {
+			continue
+		}
+		kept := e.bindings[:0]
+		for _, bd := range e.bindings {
+			if bd.queue != q.name {
+				kept = append(kept, bd)
+			}
+		}
+		e.bindings = kept
+	}
+	q.consumers = nil
 }
 
 func (c *conn) onHeader(chID uint16, p []byte) error {
@@ -848,6 +1168,16 @@ func (c *conn) onBody(chID uint16, p []byte) error {
 func (c *conn) finishPublish(ch *channel) error {
 	p := ch.pending
 	ch.pending = nil
+	if ch.tx {
+		c.b.mu.Lock()
+		ch.txOps = append(ch.txOps, func() error { return c.publishNow(ch, p) })
+		c.b.mu.Unlock()
+		return nil
+	}
+	return c.publishNow(ch, p)
+}
+
+func (c *conn) publishNow(ch *channel, p *publish) error {
 	m := Message{Exchange: p.exchange, RoutingKey: p.key, Body: p.body, Headers: p.props.headers,
 		ContentType: p.props.contentType, Correlation: p.props.correlation, ReplyTo: p.props.replyTo,
 		MessageID: p.props.messageID, Timestamp: p.props.timestamp}
@@ -955,6 +1285,8 @@ func (c *conn) settleNack(ch *channel, tag uint64, multiple, requeue bool) error
 		if requeue {
 			u.m.Redelivered = true
 			u.q.ready = append([]Message{u.m}, u.q.ready...)
+		} else {
+			b.deadLetterLocked(u.q, u.m, "rejected")
 		}
 		qs[u.q] = true
 	}
@@ -1067,6 +1399,32 @@ func (e *enc) value(v any) {
 	case map[string]any:
 		e.u8('F')
 		e.table(x)
+	case []any:
+		var a enc
+		for _, y := range x {
+			a.value(y)
+		}
+		e.u8('A')
+		e.u32(uint32(len(a.b)))
+		e.b = append(e.b, a.b...)
+	case time.Time:
+		e.u8('T')
+		e.u64(uint64(x.Unix()))
+	case float64:
+		e.u8('d')
+		e.u64(math.Float64bits(x))
+	case float32:
+		e.u8('f')
+		e.u32(math.Float32bits(x))
+	case int8:
+		e.u8('b')
+		e.u8(uint8(x))
+	case uint8:
+		e.u8('B')
+		e.u8(x)
+	case int16:
+		e.u8('s')
+		e.u16(uint16(x))
 	case nil:
 		e.u8('V')
 	default:
@@ -1121,11 +1479,9 @@ func (d *dec) value() any {
 	case 'l', 'L':
 		return int64(d.u64())
 	case 'f':
-		d.u32()
-		return nil
+		return math.Float32frombits(d.u32())
 	case 'd':
-		d.u64()
-		return nil
+		return math.Float64frombits(d.u64())
 	case 'D':
 		d.u8()
 		d.u32()
